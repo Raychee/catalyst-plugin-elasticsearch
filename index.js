@@ -49,7 +49,7 @@ class BulkLoader {
         this.elastic = elastic;
         this.createIndex = createIndex;
         this.indices = {};
-        this._ensureIndex = dedup(BulkLoader.prototype._ensureIndex.bind(this), {key: index});
+        this._ensureIndex = dedup(BulkLoader.prototype._ensureIndex.bind(this), {key: index => index});
 
         this.batchLoader = new BatchLoader(async (indexAndDocs) =>{
             const indices = new Set(indexAndDocs.map(v => {
