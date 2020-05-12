@@ -1,4 +1,5 @@
 const {Client} = require('@elastic/elasticsearch');
+const {dedup, BatchLoader} = require('@raychee/utils');
 
 
 module.exports = {
@@ -41,12 +42,104 @@ function makeFullOptions(
 }
 
 
+
+class BulkLoader {
+    constructor(logger, elastic, {createIndex} = {}) {
+        this.logger = logger;
+        this.elastic = elastic;
+        this.createIndex = createIndex;
+        this.indices = {};
+        this._ensureIndex = dedup(BulkLoader.prototype._ensureIndex.bind(this), {key: index});
+
+        this.batchLoader = new BatchLoader(async (indexAndDocs) =>{
+            const indices = new Set(indexAndDocs.map(v => {
+                const [{index:{_index}}] = v;
+                return _index;
+            }));
+            let indexRequest;
+            for (let index of indices) {
+                if (this.createIndex) {
+                    indexRequest = this.createIndex(index);
+                    index = indexRequest.index;
+                } else {
+                    indexRequest = {index: index}
+                }
+                if (index) await this._ensureIndex(index, indexRequest);
+            }
+            logger.info('The target index is all created and ready to start inserting the document');
+            const bulk = indexAndDocs.flatMap(doc => doc);
+            await this.elastic.bulk({bulk});
+        }, {maxSize: this.elastic.options.batchSize, concurrency: this.elastic.options.concurrency, maxWait: 1000});
+    }
+
+    async load(logger, index, doc) {
+        await this.batchLoader.load([index, doc]);
+    }
+
+    async _ensureIndex(logger, index, indexRequest) {
+        let {exists, refreshInterval} = this.indices[index] || {};
+        if (exists === undefined) {
+            exists = await this.elastic.indices().exists({index: index});
+        }
+        if (!exists) {
+            logger.info('Target index ', index, ' does not exist.');
+            while (true) {
+                try {
+                    await this.elastic.index({
+                        index: 'locks', id: `indices.create.${index}`, opType: 'create', body: {},
+                    });
+                    break;
+                } catch (e) {
+                    if (e.cause && e.cause.name === 'ResponseError' && e.cause.statusCode === 409) {
+                        logger.info(
+                            'There is a lock conflict for creating the target index ',
+                            index, ', will re-check after 1 second.'
+                        );
+                        await this.logger.delay(1);
+                    } else {
+                        throw e;
+                    }
+                }
+            }
+            logger.info('Create index ', index, '.');
+            if (createIndex){
+                await this.elastic.indices().create(indexRequest);
+            } else {
+                await this.elastic.indices().create(indexRequest);
+            }
+            await this.elastic.delete({index: 'locks', id: `indices.create.${index}`});
+            exists = true;
+        }
+        if (refreshInterval === undefined) {
+            const resp = await this.elastic.indices().getSettings({
+                index: index, name: 'index.refresh_interval'
+            });
+            const [{settings: {index: {refresh_interval} = {}} = {}} = {}] = Object.values(resp);
+            if (refresh_interval) {
+                refreshInterval = refresh_interval;
+            }
+        }
+        if (refreshInterval !== '-1') {
+            logger.info('Set target index ', index, '\'s refresh interval to -1.');
+            await this.elastic.indices().putSettings({
+                index: index,
+                body: {index: {refresh_interval: '-1'}},
+            });
+            refreshInterval = '-1';
+        }
+        this.indices[index] = {...this.indices[index], exists, refreshInterval};
+    }
+
+}
+
+
 class ElasticSearch {
 
     constructor(logger, options) {
         this.logger = logger;
         this.options = makeFullOptions(options);
         this.client = undefined;
+        this.bulkLoaders = {};
     }
 
     async index(logger, ...args) {
@@ -90,6 +183,13 @@ class ElasticSearch {
                 return resp;
             }
         }
+    }
+
+    async bulkUpdate(logger, index, doc, {createIndex} = {}) {
+        const key = createIndex.toString();
+        const bulkLoader = this.bulkLoaders[key] || new BulkLoader(logger, this, createIndex);
+        this.bulkLoaders[key] = bulkLoader;
+        await bulkLoader.load([index, doc]);
     }
 
     async search(logger, ...args) {
