@@ -49,28 +49,27 @@ class BulkLoader {
         this.elastic = elastic;
         this.createIndex = createIndex;
         this.indices = {};
+        this._ensureIndex = dedup(BulkLoader.prototype._ensureIndex.bind(this), {key: index});
 
-        this.batchLoader = new Batchloader(async (indexAndDocs) =>{
+        this.batchLoader = new BatchLoader(async (indexAndDocs) =>{
             const indices = new Set(indexAndDocs.map(v => {
-                let [{index:{_index}}] = v;
+                const [{index:{_index}}] = v;
                 return _index;
             }));
             let indexRequest;
             for (let index of indices) {
                 if (this.createIndex) {
                     indexRequest = this.createIndex(index);
-                    let {index} = indexRequest;
+                    index = indexRequest.index;
                 } else {
                     indexRequest = {index: index}
                 }
-                if (index) await this.ensureIndex(this, index, indexRequest);
+                if (index) await this._ensureIndex(index, indexRequest);
             }
             logger.info('The target index is all created and ready to start inserting the document');
             const bulk = indexAndDocs.flatMap(doc => doc);
             await this.elastic.bulk({bulk});
         }, {maxSize: this.elastic.options.batchSize, concurrency: this.elastic.options.concurrency, maxWait: 1000});
-
-        this.ensureIndex = dedup(this._ensureIndex.bind(this, index, indexRequest), {key: index})
     }
 
     async load(logger, index, doc) {
@@ -187,15 +186,10 @@ class ElasticSearch {
     }
 
     async bulkUpdate(logger, index, doc, {createIndex} = {}) {
-        let bulkLoader;
         const key = createIndex.toString();
-        if (!this.bulkLoaders || !this.bulkLoaders[key]) {
-            bulkLoader = this.bulkLoaders[key]
-        } else {
-            bulkLoader = new BulkLoader(logger, this, createIndex);
-            this.bulkLoaders[key] = bulkLoader;
-        }
-        await bulkLoader.load([index, doc])
+        const bulkLoader = this.bulkLoaders[key] || new BulkLoader(logger, this, createIndex);
+        this.bulkLoaders[key] = bulkLoader;
+        await bulkLoader.load([index, doc]);
     }
 
     async search(logger, ...args) {
