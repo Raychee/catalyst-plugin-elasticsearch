@@ -185,7 +185,7 @@ class ElasticSearch {
         }
     }
 
-    async bulkUpdate(logger, index, doc, {createIndex} = {}) {
+    async bulkIndex(logger, index, doc, {createIndex} = {}) {
         const key = createIndex.toString();
         const bulkLoader = this.bulkLoaders[key] || new BulkLoader(logger, this, createIndex);
         this.bulkLoaders[key] = bulkLoader;
