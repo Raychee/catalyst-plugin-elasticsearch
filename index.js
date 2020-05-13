@@ -26,6 +26,8 @@ function makeFullOptions(
         bulk: {
             retryIntervalForTooManyRequests: 1,
             maxRetriesForTooManyRequests: 0,
+            batchSize: 200,
+            concurrency: 1,
             ...bulk,
         },
         searchAndScroll: {
@@ -48,31 +50,86 @@ function makeFullOptions(
 class BulkLoader {
     constructor(elastic) {
         this.elastic = elastic;
-        this._ensureIndex = dedup(BulkLoader.prototype._ensureIndex.bind(this), {key: (_, index, ) => index});
-        this.bulkIndex = limit(BulkLoader.prototype.bulkIndex.bind(this), 1);
+        this._ensureIndex = dedup(BulkLoader.prototype._ensureIndex.bind(this), {key: (_, index) => index});
+        this.index = limit(BulkLoader.prototype.index.bind(this), 1);
         this.indices = {};
         this.updating = {};
         this.errors = [];
         this.bulk = [];
     }
 
-    async _bulkIndex(opId, bulk) {
+    async index(logger, index, source, {createIndex} = {}) {
+        this.bulk.push({logger, index, source, createIndex});
+        if (this.bulk.length >= this.elastic.options.bulk.batchSize) {
+            await this._commit(logger);
+        }
+    }
+
+    async flush(logger) {
+        if (this.bulk.length > 0) {
+            await this._commit(logger);
+        }
+        if (!isEmpty(this.updating)) {
+            await Promise.all(Object.values(this.updating));
+            this.updating = {};
+        }
+        for (const [index, {refreshInterval}] of Object.entries(this.indices)) {
+            if (refreshInterval === '-1') {
+                logger.info('Set target index ', index, '\'s refresh interval back to 1s.');
+                await this.elastic.indices().putSettings({
+                    index, body: {index: {refresh_interval: '1s'}},
+                });
+            }
+        }
+        if (this.errors.length > 0) {
+            const [error] = this.errors;
+            this.errors = [];
+            throw error;
+        }
+    }
+    
+    async _commit(logger) {
+        if (this.errors.length > 0) {
+            throw this.errors[0];
+        }
+        const opId = uuid4();
+        const bulk = this.bulk;
+        this.bulk = [];
+        while (Object.keys(this.updating).length >= this.elastic.options.bulk.concurrency) {
+            logger.info('Wait for concurrency before indexing a batch: id = ', opId, ', size = ', bulk.length, '.');
+            await Promise.race(Object.values(this.updating));
+            if (this.errors.length > 0) {
+                throw this.errors[0];
+            }
+        }
+        logger.info(
+            'Index a batch: id = ', opId, ', size = ', bulk.length,
+            ', concurrency = ', Object.keys(this.updating).length + 1, '/', this.elastic.options.bulk.concurrency, '.'
+        );
+        this.updating[opId] = this._index(bulk)
+            .catch(e => this.errors.push(e))
+            .finally(() => {
+                delete this.updating[opId];
+                logger.info(
+                    'Complete indexing a batch: id = ', opId, ', size = ', bulk.length,
+                    ', concurrency = ', Object.keys(this.updating).length, '/', this.elastic.options.bulk.concurrency, '.'
+                );
+            });
+    }
+
+    async _index(bulk) {
         const bulkInfo = {};
         const [{logger}] = bulk;
-        logger.info('Index a batch (id = ', opId, ', size = ', this.bulk.length, ').');
-
-        for (const {logger, index: {index: {_index}}, source, createIndex} of bulk) {
+        for (const {logger, index: {index: {_index}}, createIndex} of bulk) {
             const indexRequest = createIndex ? createIndex(_index) : {index: _index};
             const index = indexRequest.index;
             bulkInfo[index] = {logger, indexRequest};
         }
         for (let [index, {logger, indexRequest}] of Object.entries(bulkInfo)) {
-            if (index) await this._ensureIndex(logger, index, indexRequest);
+            await this._ensureIndex(logger, index, indexRequest);
         }
         const body = bulk.flatMap(v => [v.index, v.source]);
         await this.elastic.bulk(logger, {body});
-
-        logger.info('Index a batch (id = ', opId, ') is complete.');
     }
 
     async _ensureIndex(logger, index, indexRequest) {
@@ -123,46 +180,6 @@ class BulkLoader {
             refreshInterval = '-1';
         }
         this.indices[index] = {...this.indices[index], exists, refreshInterval};
-    }
-
-    async bulkIndex(logger, index, source, {createIndex} = {}) {
-        this.bulk.push({logger, index, source, createIndex});
-        if (this.bulk.length >= this.elastic.options.bulk.batchSize) {
-            if (this.errors.length > 0) {
-                throw this.errors[0];
-            }
-            while (Object.keys(this.updating).length >= this.elastic.options.bulk.concurrency) {
-                const opId = await Promise.race(Object.values(this.updating));
-                if (this.errors.length > 0) {
-                    throw this.errors[0];
-                }
-                delete this.updating[opId];
-            }
-            const opId = uuid4();
-            this.updating[opId] = this._bulkIndex(opId, this.bulk).catch(e => {
-                this.errors.push(e);
-                return opId;
-            });
-            this.bulk = [];
-        }
-    }
-
-    async bulkFlush(logger) {
-        if (!isEmpty(this.updating)) {
-            await Promise.all(Object.values(this.updating));
-            this.updating = {};
-        }
-        if (this.errors.length > 0) {
-            throw this.errors[0];
-        }
-        for (const [index, {refreshInterval}] of Object.entries(this.indices)) {
-            if (refreshInterval === '-1') {
-                logger.info('Set target index ', index, '\'s refresh interval back to 1s.');
-                await this.elastic.indices().putSettings({
-                    index, body: {index: {refresh_interval: '1s'}},
-                });
-            }
-        }
     }
 }
 
@@ -220,11 +237,11 @@ class ElasticSearch {
     }
 
     async bulkIndex(logger, ...args) {
-        await this.bulkLoader.bulkIndex(logger, ...args);
+        await this.bulkLoader.index(logger, ...args);
     }
 
     async bulkFlush(logger) {
-        await this.bulkLoader.bulkFlush(logger);
+        await this.bulkLoader.flush(logger);
     }
 
     async search(logger, ...args) {
