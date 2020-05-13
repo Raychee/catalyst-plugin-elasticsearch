@@ -16,6 +16,7 @@
   "homepage": "https://github.com/Raychee/catalyst-plugin-elasticsearch#readme",
   "dependencies": {
     "@elastic/elasticsearch": "^7.6.1",
-    "@raychee/utils": "^0.2.3"
+    "@raychee/utils": "^0.2.3",
+    "uuid": "^8.0.0"
   }
 }
