@@ -1,7 +1,7 @@
 const {Client} = require('@elastic/elasticsearch');
 const {dedup, limit} = require('@raychee/utils');
 const {isEmpty} = require('lodash');
-const uuid = require('uuid');
+const {v4: uuid4} = require('uuid');
 
 
 module.exports = {
@@ -48,9 +48,8 @@ function makeFullOptions(
 class BulkLoader {
     constructor(elastic) {
         this.elastic = elastic;
-        this._ensureIndex = dedup(BulkLoader.prototype._ensureIndex.bind(this), {key: (logger, index, ) => index});
+        this._ensureIndex = dedup(BulkLoader.prototype._ensureIndex.bind(this), {key: (_, index, ) => index});
         this.bulkIndex = limit(BulkLoader.prototype.bulkIndex.bind(this), 1);
-        this.logger = {};
         this.indices = {};
         this.updating = {};
         this.errors = [];
@@ -62,8 +61,7 @@ class BulkLoader {
         const [{logger}] = bulk;
         logger.info('Index a batch (id = ', opId, ', size = ', this.bulk.length, ').');
 
-        // for (const bulk of this.bulk) {
-        for (const {logger, idx: {index: {_index}}, source, createIndex} of bulk) {
+        for (const {logger, index: {index: {_index}}, source, createIndex} of bulk) {
             const indexRequest = createIndex ? createIndex(_index) : {index: _index};
             const index = indexRequest.index;
             bulkInfo[index] = {logger, indexRequest};
@@ -71,8 +69,8 @@ class BulkLoader {
         for (let [index, {logger, indexRequest}] of Object.entries(bulkInfo)) {
             if (index) await this._ensureIndex(logger, index, indexRequest);
         }
-        const body = bulk.flatMap(v => [v.idx, v.source]);
-        await this.elastic.bulk(logger, {body: body});
+        const body = bulk.flatMap(v => [v.index, v.source]);
+        await this.elastic.bulk(logger, {body});
 
         logger.info('Index a batch (id = ', opId, ') is complete.');
     }
@@ -128,7 +126,7 @@ class BulkLoader {
     }
 
     async bulkIndex(logger, index, source, {createIndex} = {}) {
-        this.bulk.push({logger, idx: index, source, createIndex});
+        this.bulk.push({logger, index, source, createIndex});
         if (this.bulk.length >= this.elastic.options.bulk.batchSize) {
             if (this.errors.length > 0) {
                 throw this.errors[0];
@@ -140,7 +138,7 @@ class BulkLoader {
                 }
                 delete this.updating[opId];
             }
-            const opId = uuid();
+            const opId = uuid4();
             this.updating[opId] = this._bulkIndex(opId, this.bulk).catch(e => {
                 this.errors.push(e);
                 return opId;
@@ -152,6 +150,7 @@ class BulkLoader {
     async bulkFlush(logger) {
         if (!isEmpty(this.updating)) {
             await Promise.all(Object.values(this.updating));
+            this.updating = {};
         }
         if (this.errors.length > 0) {
             throw this.errors[0];
