@@ -1,5 +1,5 @@
 const {Client} = require('@elastic/elasticsearch');
-const {dedup, limit} = require('@raychee/utils');
+const {dedup} = require('@raychee/utils');
 const {isEmpty} = require('lodash');
 const {v4: uuid4} = require('uuid');
 
@@ -51,9 +51,9 @@ class BulkLoader {
     constructor(elastic) {
         this.elastic = elastic;
         this._ensureIndex = dedup(BulkLoader.prototype._ensureIndex.bind(this), {key: (_, index) => index});
-        this.index = limit(BulkLoader.prototype.index.bind(this), 1);
         this.indices = {};
         this.updating = {};
+        this.flushing = undefined;
         this.errors = [];
         this.bulk = [];
     }
@@ -61,31 +61,18 @@ class BulkLoader {
     async index(logger, index, source, {createIndex} = {}) {
         this.bulk.push({logger, index, source, createIndex});
         if (this.bulk.length >= this.elastic.options.bulk.batchSize) {
+            if (this.flushing) {
+                await this.flushing;
+            }
             await this._commit(logger);
         }
     }
 
     async flush(logger) {
-        if (this.bulk.length > 0) {
-            await this._commit(logger);
+        if (!this.flushing) {
+            this.flushing = this._flush(logger).finally(() => this.flushing = undefined);
         }
-        if (!isEmpty(this.updating)) {
-            await Promise.all(Object.values(this.updating));
-            this.updating = {};
-        }
-        for (const [index, {refreshInterval}] of Object.entries(this.indices)) {
-            if (refreshInterval === '-1') {
-                logger.info('Set target index ', index, '\'s refresh interval back to 1s.');
-                await this.elastic.indices().putSettings({
-                    index, body: {index: {refresh_interval: '1s'}},
-                });
-            }
-        }
-        if (this.errors.length > 0) {
-            const [error] = this.errors;
-            this.errors = [];
-            throw error;
-        }
+        await this.flushing;
     }
     
     async _commit(logger) {
@@ -94,6 +81,7 @@ class BulkLoader {
         }
         const opId = uuid4();
         const bulk = this.bulk;
+        if (bulk.length <= 0) return;
         this.bulk = [];
         while (Object.keys(this.updating).length >= this.elastic.options.bulk.concurrency) {
             logger.info('Wait for concurrency before indexing a batch: id = ', opId, ', size = ', bulk.length, '.');
@@ -115,6 +103,29 @@ class BulkLoader {
                     ', concurrency = ', Object.keys(this.updating).length, '/', this.elastic.options.bulk.concurrency, '.'
                 );
             });
+    }
+    
+    async _flush(logger) {
+        if (this.bulk.length > 0) {
+            await this._commit(logger);
+        }
+        if (!isEmpty(this.updating)) {
+            await Promise.all(Object.values(this.updating));
+            this.updating = {};
+        }
+        for (const [index, {refreshInterval}] of Object.entries(this.indices)) {
+            if (refreshInterval === '-1') {
+                logger.info('Set target index ', index, '\'s refresh interval back to 1s.');
+                await this.elastic.indices().putSettings({
+                    index, body: {index: {refresh_interval: '1s'}},
+                });
+            }
+        }
+        if (this.errors.length > 0) {
+            const [error] = this.errors;
+            this.errors = [];
+            throw error;
+        }
     }
 
     async _index(bulk) {
