@@ -104,12 +104,6 @@ class BulkLoader {
             }
             logger.info('Create index ', index, '.');
             await this.elastic.indices().create(indexRequest);
-
-            if (createIndex){
-
-            } else {
-                await this.elastic.indices().create(indexRequest);
-            }
             await this.elastic.delete({index: 'locks', id: `indices.create.${index}`});
             exists = true;
         }
