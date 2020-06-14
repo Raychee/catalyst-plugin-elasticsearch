@@ -74,7 +74,7 @@ class BulkLoader {
         }
         await this.flushing;
     }
-    
+
     async _commit(logger) {
         if (this.errors.length > 0) {
             throw this.errors[0];
@@ -106,6 +106,7 @@ class BulkLoader {
     }
     
     async _flush(logger) {
+        logger = logger || this.elastic.logger;
         if (this.bulk.length > 0) {
             await this._commit(logger);
         }
@@ -113,12 +114,14 @@ class BulkLoader {
             await Promise.all(Object.values(this.updating));
             this.updating = {};
         }
-        for (const [index, {refreshInterval}] of Object.entries(this.indices)) {
+        for (const [index, state] of Object.entries(this.indices)) {
+            const {refreshInterval} = state;
             if (refreshInterval === '-1') {
                 logger.info('Set target index ', index, '\'s refresh interval back to 1s.');
-                await this.elastic.indices().putSettings({
+                await this.elastic.indices(logger).putSettings({
                     index, body: {index: {refresh_interval: '1s'}},
                 });
+                state.refreshInterval = '1s';
             }
         }
         if (this.errors.length > 0) {
@@ -144,16 +147,21 @@ class BulkLoader {
     }
 
     async _ensureIndex(logger, index, indexRequest) {
+        logger = logger || this.elastic.logger;
+        
+        indexRequest = indexRequest || {index};
+        const realIndex = indexRequest.index || index;
+
         let {exists, refreshInterval} = this.indices[index] || {};
         if (exists === undefined) {
-            exists = await this.elastic.indices().exists({index: index});
+            exists = await this.elastic.indices(logger).exists({index});
         }
         if (!exists) {
             logger.info('Target index ', index, ' does not exist.');
             while (true) {
                 try {
-                    await this.elastic.index({
-                        index: 'locks', id: `indices.create.${index}`, opType: 'create', body: {},
+                    await this.elastic.index(logger, {
+                        index: 'locks', id: `indices.create.${realIndex}`, opType: 'create', body: {},
                     });
                     break;
                 } catch (e) {
@@ -169,12 +177,12 @@ class BulkLoader {
                 }
             }
             logger.info('Create index ', index, '.');
-            await this.elastic.indices().create(indexRequest);
-            await this.elastic.delete({index: 'locks', id: `indices.create.${index}`});
+            await this.elastic.indices(logger).create(indexRequest);
+            await this.elastic.delete(logger, {index: 'locks', id: `indices.create.${realIndex}`});
             exists = true;
         }
         if (refreshInterval === undefined) {
-            const resp = await this.elastic.indices().getSettings({
+            const resp = await this.elastic.indices(logger).getSettings({
                 index: index, name: 'index.refresh_interval'
             });
             const [{settings: {index: {refresh_interval} = {}} = {}} = {}] = Object.values(resp);
@@ -184,13 +192,14 @@ class BulkLoader {
         }
         if (refreshInterval !== '-1') {
             logger.info('Set target index ', index, '\'s refresh interval to -1.');
-            await this.elastic.indices().putSettings({
+            await this.elastic.indices(logger).putSettings({
                 index: index,
                 body: {index: {refresh_interval: '-1'}},
             });
             refreshInterval = '-1';
         }
         this.indices[index] = {...this.indices[index], exists, refreshInterval};
+        this.indices[realIndex] = this.indices[index];
     }
 }
 
@@ -254,6 +263,10 @@ class ElasticSearch {
     async bulkFlush(logger) {
         await this.bulkLoader.flush(logger);
     }
+    
+    async prepareIndexForBulk(logger, ...args) {
+        await this.bulkLoader._ensureIndex(logger, ...args);
+    }
 
     async search(logger, ...args) {
         logger = logger || this.logger;
@@ -293,6 +306,12 @@ class ElasticSearch {
                 break;
             }
         }
+    }
+    
+    async deleteByQuery(logger, ...args) {
+        logger = logger || this.logger;
+        args = this._validateArgs(logger, args);
+        return await this._operate(logger, client => client.deleteByQuery(...args));
     }
 
     indices(logger) {
