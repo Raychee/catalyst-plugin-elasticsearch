@@ -1,5 +1,5 @@
 const {Client} = require('@elastic/elasticsearch');
-const {dedup} = require('@raychee/utils');
+const {dedup, ensureThunkSync} = require('@raychee/utils');
 const {isEmpty} = require('lodash');
 const {v4: uuid4} = require('uuid');
 
@@ -135,8 +135,8 @@ class BulkLoader {
         const bulkInfo = {};
         const [{logger}] = bulk;
         for (const {logger, index: {index: {_index}}, createIndex} of bulk) {
-            const indexRequest = createIndex ? createIndex(_index) : {index: _index};
-            const index = indexRequest.index;
+            const indexRequest = createIndex ? ensureThunkSync(createIndex, _index) : {index: _index};
+            const index = _index || indexRequest.index;
             bulkInfo[index] = {logger, indexRequest};
         }
         for (let [index, {logger, indexRequest}] of Object.entries(bulkInfo)) {
@@ -151,6 +151,7 @@ class BulkLoader {
         
         indexRequest = indexRequest || {index};
         const realIndex = indexRequest.index || index;
+        let createdRealIndex = false;
 
         let {exists, refreshInterval} = this.indices[index] || {};
         if (exists === undefined) {
@@ -180,6 +181,7 @@ class BulkLoader {
             await this.elastic.indices(logger).create(indexRequest);
             await this.elastic.delete(logger, {index: 'locks', id: `indices.create.${realIndex}`});
             exists = true;
+            createdRealIndex = true;
         }
         if (refreshInterval === undefined) {
             const resp = await this.elastic.indices(logger).getSettings({
@@ -199,7 +201,9 @@ class BulkLoader {
             refreshInterval = '-1';
         }
         this.indices[index] = {...this.indices[index], exists, refreshInterval};
-        this.indices[realIndex] = this.indices[index];
+        if (createdRealIndex) {
+            this.indices[realIndex] = this.indices[index];
+        }
     }
 }
 
