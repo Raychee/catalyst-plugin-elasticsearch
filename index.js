@@ -1,6 +1,6 @@
 const {Client} = require('@elastic/elasticsearch');
-const {dedup, ensureThunkSync} = require('@raychee/utils');
-const {isEmpty} = require('lodash');
+const {dedup, limit, ensureThunkSync} = require('@raychee/utils');
+const {isEmpty, get} = require('lodash');
 const {v4: uuid4} = require('uuid');
 
 
@@ -11,6 +11,10 @@ module.exports = {
     },
     async create(options) {
         return new ElasticSearch(this, options);
+    },
+    unload(elasticSearch, job) {
+        const jobId = getJobId(job);
+        delete elasticSearch.bulkLoaders[jobId];
     },
     async destroy(elasticSearch) {
         await elasticSearch._close();
@@ -45,17 +49,21 @@ function makeFullOptions(
     }
 }
 
-
+function getJobId(logger) {
+    return get(logger, ['config', 'id'], '');
+}
 
 class BulkLoader {
     constructor(elastic) {
         this.elastic = elastic;
-        this._ensureIndex = dedup(BulkLoader.prototype._ensureIndex.bind(this), {key: (_, index) => index});
         this.indices = {};
         this.updating = {};
         this.flushing = undefined;
         this.errors = [];
         this.bulk = [];
+        
+        this.index = limit(BulkLoader.prototype.index.bind(this), 1);
+        this._ensureIndex = dedup(BulkLoader.prototype._ensureIndex.bind(this), {key: (_, index) => index});
     }
 
     async index(logger, index, source, {createIndex} = {}) {
@@ -82,7 +90,6 @@ class BulkLoader {
         const opId = uuid4();
         const bulk = this.bulk;
         if (bulk.length <= 0) return;
-        this.bulk = [];
         while (Object.keys(this.updating).length >= this.elastic.options.bulk.concurrency) {
             logger.info('Wait for concurrency before indexing a batch: id = ', opId, ', size = ', bulk.length, '.');
             await Promise.race(Object.values(this.updating));
@@ -103,6 +110,7 @@ class BulkLoader {
                     ', concurrency = ', Object.keys(this.updating).length, '/', this.elastic.options.bulk.concurrency, '.'
                 );
             });
+        this.bulk = [];
     }
     
     async _flush(logger) {
@@ -213,7 +221,7 @@ class ElasticSearch {
     constructor(logger, options) {
         this.logger = logger;
         this.options = makeFullOptions(options);
-        this.bulkLoader = new BulkLoader(this);
+        this.bulkLoaders = {};
         this.client = undefined;
     }
 
@@ -261,15 +269,15 @@ class ElasticSearch {
     }
 
     async bulkIndex(logger, ...args) {
-        await this.bulkLoader.index(logger, ...args);
+        await this._getBulkLoader(logger).index(logger, ...args);
     }
 
     async bulkFlush(logger) {
-        await this.bulkLoader.flush(logger);
+        await this._getBulkLoader(logger).flush(logger);
     }
     
     async prepareIndexForBulk(logger, ...args) {
-        await this.bulkLoader._ensureIndex(logger, ...args);
+        await this._getBulkLoader(logger)._ensureIndex(logger, ...args);
     }
 
     async search(logger, ...args) {
@@ -361,6 +369,14 @@ class ElasticSearch {
             this.client = undefined;
             await client.close();
         }
+    }
+    
+    _getBulkLoader(logger) {
+        logger = logger || this.logger;
+        const jobId = getJobId(logger);
+        const bulkLoader = this.bulkLoaders[jobId] || new BulkLoader(this);
+        this.bulkLoaders[jobId] = bulkLoader;
+        return bulkLoader;
     }
 
     _validateArgs(logger, args) {
