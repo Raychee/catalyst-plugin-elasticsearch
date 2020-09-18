@@ -1,6 +1,6 @@
 {
   "name": "@raychee/catalyst-plugin-elasticsearch",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "description": "elasticsearch plugin for catalyst",
   "main": "index.js",
   "scripts": {},
@@ -15,9 +15,11 @@
   },
   "homepage": "https://github.com/Raychee/catalyst-plugin-elasticsearch#readme",
   "dependencies": {
-    "@elastic/elasticsearch": "^7.6.1",
     "@raychee/utils": "^0.2.9",
     "lodash": "^4.17.15",
     "uuid": "^8.0.0"
+  },
+  "peerDependencies": {
+    "@elastic/elasticsearch": "^7.6.1"
   }
 }

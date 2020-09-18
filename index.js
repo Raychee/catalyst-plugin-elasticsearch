@@ -58,6 +58,7 @@ class BulkLoader {
         this.elastic = elastic;
         this.indices = {};
         this.updating = {};
+        this.committing = undefined;
         this.flushing = undefined;
         this.errors = [];
         this.bulk = [];
@@ -67,13 +68,16 @@ class BulkLoader {
     }
 
     async index(logger, index, source, {createIndex} = {}) {
-        this.bulk.push({logger, index, source, createIndex});
-        if (this.bulk.length >= this.elastic.options.bulk.batchSize) {
+        while (this.bulk.length >= this.elastic.options.bulk.batchSize) {
             if (this.flushing) {
                 await this.flushing;
             }
-            await this._commit(logger);
+            if (!this.committing) {
+                this.committing = this._commit(logger).finally(() => this.committing = undefined);
+            }
+            await this.committing;
         }
+        this.bulk.push({logger, index, source, createIndex});
     }
 
     async flush(logger) {
@@ -84,18 +88,17 @@ class BulkLoader {
     }
 
     async _commit(logger) {
-        if (this.errors.length > 0) {
-            throw this.errors[0];
-        }
         const opId = uuid4();
         const bulk = this.bulk;
         if (bulk.length <= 0) return;
         while (Object.keys(this.updating).length >= this.elastic.options.bulk.concurrency) {
             logger.info('Wait for concurrency before indexing a batch: id = ', opId, ', size = ', bulk.length, '.');
             await Promise.race(Object.values(this.updating));
-            if (this.errors.length > 0) {
-                throw this.errors[0];
-            }
+        }
+        if (this.errors.length > 0) {
+            const [error] = this.errors;
+            this.errors = [];
+            throw error;
         }
         logger.info(
             'Index a batch: id = ', opId, ', size = ', bulk.length,
@@ -116,11 +119,14 @@ class BulkLoader {
     async _flush(logger) {
         logger = logger || this.elastic.logger;
         if (this.bulk.length > 0) {
-            await this._commit(logger);
+            while (this.committing) {
+                await this.committing;
+            }
+            this.committing = this._commit(logger).finally(() => this.committing = undefined);
+            await this.committing;
         }
         if (!isEmpty(this.updating)) {
             await Promise.all(Object.values(this.updating));
-            this.updating = {};
         }
         for (const [index, state] of Object.entries(this.indices)) {
             const {refreshInterval} = state;
