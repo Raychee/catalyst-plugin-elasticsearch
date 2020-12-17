@@ -71,7 +71,7 @@ class BulkLoader {
         this.bulk.push({logger, index, source, createIndex});
     }
 
-    async flush(logger, {debug}) {
+    async flush(logger, {debug} = {}) {
         logger = logger || this.elastic.logger;
         if (this.bulk.length > 0) {
             if (!this.committing) {
