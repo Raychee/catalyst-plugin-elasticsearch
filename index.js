@@ -1,5 +1,5 @@
 const {Client} = require('@elastic/elasticsearch');
-const {dedup, limit, ensureThunkSync} = require('@raychee/utils');
+const {dedup, ensureThunkSync} = require('@raychee/utils');
 const {isEmpty, get} = require('lodash');
 const {v4: uuid4} = require('uuid');
 
@@ -11,10 +11,6 @@ module.exports = {
     },
     async create(options) {
         return new ElasticSearch(this, options);
-    },
-    unload(elasticSearch, job) {
-        const jobId = getJobId(job);
-        delete elasticSearch.bulkLoaders[jobId];
     },
     async destroy(elasticSearch) {
         await elasticSearch._close();
@@ -49,9 +45,6 @@ function makeFullOptions(
     }
 }
 
-function getJobId(logger) {
-    return get(logger, ['config', 'id'], '');
-}
 
 class BulkLoader {
     constructor(elastic) {
@@ -59,40 +52,51 @@ class BulkLoader {
         this.indices = {};
         this.updating = {};
         this.committing = undefined;
-        this.flushing = undefined;
         this.errors = [];
         this.bulk = [];
         
-        this.index = limit(BulkLoader.prototype.index.bind(this), 1);
         this._ensureIndex = dedup(BulkLoader.prototype._ensureIndex.bind(this), {key: (_, index) => index});
     }
 
-    async index(logger, index, source, {createIndex} = {}) {
+    async index(logger, index, source, {debug, createIndex} = {}) {
+        while (this.committing) {
+            await this.committing;
+        }
         while (this.bulk.length >= this.elastic.options.bulk.batchSize) {
-            if (this.flushing) {
-                await this.flushing;
-            }
             if (!this.committing) {
-                this.committing = this._commit(logger).finally(() => this.committing = undefined);
+                this.committing = this._commit(logger, {debug}).finally(() => this.committing = undefined);
             }
             await this.committing;
         }
         this.bulk.push({logger, index, source, createIndex});
     }
 
-    async flush(logger) {
-        if (!this.flushing) {
-            this.flushing = this._flush(logger).finally(() => this.flushing = undefined);
+    async flush(logger, {debug}) {
+        logger = logger || this.elastic.logger;
+        if (this.bulk.length > 0) {
+            if (!this.committing) {
+                this.committing = this._commit(logger, {debug}).finally(() => this.committing = undefined);
+            }
+            await this.committing;
         }
-        await this.flushing;
+        if (!isEmpty(this.updating)) {
+            await Promise.all(Object.values(this.updating));
+        }
+        if (this.errors.length > 0) {
+            const [error] = this.errors;
+            this.errors = [];
+            throw error;
+        }
     }
 
-    async _commit(logger) {
+    async _commit(logger, {debug} = {}) {
         const opId = uuid4();
         const bulk = this.bulk;
         if (bulk.length <= 0) return;
         while (Object.keys(this.updating).length >= this.elastic.options.bulk.concurrency) {
-            logger.info('Wait for concurrency before indexing a batch: id = ', opId, ', size = ', bulk.length, '.');
+            if (debug || this.elastic.options.otherOptions.debug) {
+                logger.debug('Wait for concurrency before indexing a batch: id = ', opId, ', size = ', bulk.length, '.');
+            }
             await Promise.race(Object.values(this.updating));
         }
         if (this.errors.length > 0) {
@@ -100,60 +104,35 @@ class BulkLoader {
             this.errors = [];
             throw error;
         }
-        logger.info(
-            'Index a batch: id = ', opId, ', size = ', bulk.length,
-            ', concurrency = ', Object.keys(this.updating).length + 1, '/', this.elastic.options.bulk.concurrency, '.'
-        );
+        if (debug || this.elastic.options.otherOptions.debug) {
+            logger.debug(
+                'Index a batch: id = ', opId, ', size = ', bulk.length,
+                ', concurrency = ', Object.keys(this.updating).length + 1, '/', this.elastic.options.bulk.concurrency, '.'
+            );
+        }
         this.updating[opId] = this._index(bulk)
             .catch(e => this.errors.push(e))
             .finally(() => {
                 delete this.updating[opId];
-                logger.info(
-                    'Complete indexing a batch: id = ', opId, ', size = ', bulk.length,
-                    ', concurrency = ', Object.keys(this.updating).length, '/', this.elastic.options.bulk.concurrency, '.'
-                );
+                if (debug || this.elastic.options.otherOptions.debug) {
+                    logger.debug(
+                        'Complete indexing a batch: id = ', opId, ', size = ', bulk.length,
+                        ', concurrency = ', Object.keys(this.updating).length, '/', this.elastic.options.bulk.concurrency, '.'
+                    );
+                }
             });
         this.bulk = [];
     }
     
-    async _flush(logger) {
-        logger = logger || this.elastic.logger;
-        if (this.bulk.length > 0) {
-            while (this.committing) {
-                await this.committing;
-            }
-            this.committing = this._commit(logger).finally(() => this.committing = undefined);
-            await this.committing;
-        }
-        if (!isEmpty(this.updating)) {
-            await Promise.all(Object.values(this.updating));
-        }
-        for (const [index, state] of Object.entries(this.indices)) {
-            const {refreshInterval} = state;
-            if (refreshInterval === '-1') {
-                logger.info('Set target index ', index, '\'s refresh interval back to 1s.');
-                await this.elastic.indices(logger).putSettings({
-                    index, body: {index: {refresh_interval: '1s'}},
-                });
-                state.refreshInterval = '1s';
-            }
-        }
-        if (this.errors.length > 0) {
-            const [error] = this.errors;
-            this.errors = [];
-            throw error;
-        }
-    }
-
     async _index(bulk) {
-        const bulkInfo = {};
+        const bulkIndices = {};
         const [{logger}] = bulk;
         for (const {logger, index: {index: {_index}}, createIndex} of bulk) {
             const indexRequest = createIndex ? ensureThunkSync(createIndex, _index) : {index: _index};
             const index = _index || indexRequest.index;
-            bulkInfo[index] = {logger, indexRequest};
+            bulkIndices[index] = {logger, indexRequest};
         }
-        for (let [index, {logger, indexRequest}] of Object.entries(bulkInfo)) {
+        for (const [index, {logger, indexRequest}] of Object.entries(bulkIndices)) {
             await this._ensureIndex(logger, index, indexRequest);
         }
         const body = bulk.flatMap(v => [v.index, v.source]);
@@ -167,57 +146,47 @@ class BulkLoader {
         const realIndex = indexRequest.index || index;
         let createdRealIndex = false;
 
-        let {exists, refreshInterval} = this.indices[index] || {};
+        let {exists} = this.indices[index] || {};
         if (exists === undefined) {
             exists = await this.elastic.indices(logger).exists({index});
         }
         if (!exists) {
             logger.info('Target index ', index, ' does not exist.');
-            while (true) {
-                try {
-                    await this.elastic.index(logger, {
-                        index: 'locks', id: `indices.create.${realIndex}`, opType: 'create', body: {},
-                    });
-                    break;
-                } catch (e) {
-                    if (e.cause && e.cause.name === 'ResponseError' && e.cause.statusCode === 409) {
-                        logger.info(
-                            'There is a lock conflict for creating the target index ',
-                            index, ', will re-check after 1 second.'
-                        );
-                        await logger.delay(1);
-                    } else {
-                        throw e;
-                    }
-                }
-            }
+            const lockCreateIndex = `indices.create.${realIndex}`;
+            await this._lock(logger, lockCreateIndex);
             logger.info('Create index ', index, '.');
             await this.elastic.indices(logger).create(indexRequest);
-            await this.elastic.delete(logger, {index: 'locks', id: `indices.create.${realIndex}`});
+            await this._unlock(logger, lockCreateIndex)
             exists = true;
             createdRealIndex = true;
         }
-        if (refreshInterval === undefined) {
-            const resp = await this.elastic.indices(logger).getSettings({
-                index: index, name: 'index.refresh_interval'
-            });
-            const [{settings: {index: {refresh_interval} = {}} = {}} = {}] = Object.values(resp);
-            if (refresh_interval) {
-                refreshInterval = refresh_interval;
-            }
-        }
-        if (refreshInterval !== '-1') {
-            logger.info('Set target index ', index, '\'s refresh interval to -1.');
-            await this.elastic.indices(logger).putSettings({
-                index: index,
-                body: {index: {refresh_interval: '-1'}},
-            });
-            refreshInterval = '-1';
-        }
-        this.indices[index] = {...this.indices[index], exists, refreshInterval};
+        this.indices[index] = {...this.indices[index], exists};
         if (createdRealIndex) {
             this.indices[realIndex] = this.indices[index];
         }
+    }
+    
+    async _lock(logger, lockId) {
+        logger = logger || this.elastic.logger;
+        while (true) {
+            try {
+                await this.elastic.index(logger, {
+                    index: 'locks', id: lockId, opType: 'create', body: {},
+                });
+                break;
+            } catch (e) {
+                if (e.cause && e.cause.name === 'ResponseError' && e.cause.statusCode === 409) {
+                    logger.info('There is a lock conflict for ', lockId, ', will re-check after 1 second.');
+                    await logger.delay(1);
+                } else {
+                    throw e;
+                }
+            }
+        }
+    }
+    
+    async _unlock(logger, lockId) {
+        await this.elastic.delete(logger, {index: 'locks', id: lockId});
     }
 }
 
@@ -227,8 +196,8 @@ class ElasticSearch {
     constructor(logger, options) {
         this.logger = logger;
         this.options = makeFullOptions(options);
-        this.bulkLoaders = {};
-        this.client = undefined;
+        this._bulkLoader = new BulkLoader(this);
+        this._client = undefined;
     }
 
     async index(logger, ...args) {
@@ -275,15 +244,15 @@ class ElasticSearch {
     }
 
     async bulkIndex(logger, ...args) {
-        await this._getBulkLoader(logger).index(logger, ...args);
+        await this._bulkLoader.index(logger, ...args);
     }
 
     async bulkFlush(logger) {
-        await this._getBulkLoader(logger).flush(logger);
+        await this._bulkLoader.flush(logger);
     }
     
     async prepareIndexForBulk(logger, ...args) {
-        await this._getBulkLoader(logger)._ensureIndex(logger, ...args);
+        await this._bulkLoader._ensureIndex(logger, ...args);
     }
 
     async search(logger, ...args) {
@@ -363,26 +332,18 @@ class ElasticSearch {
     }
 
     async _connect() {
-        if (!this.client) {
-            this.client = new Client(this.options.client);
+        if (!this._client) {
+            this._client = new Client(this.options.client);
         }
-        return this.client;
+        return this._client;
     }
 
     async _close() {
-        if (this.client) {
-            const client = this.client;
-            this.client = undefined;
+        if (this._client) {
+            const client = this._client;
+            this._client = undefined;
             await client.close();
         }
-    }
-    
-    _getBulkLoader(logger) {
-        logger = logger || this.logger;
-        const jobId = getJobId(logger);
-        const bulkLoader = this.bulkLoaders[jobId] || new BulkLoader(this);
-        this.bulkLoaders[jobId] = bulkLoader;
-        return bulkLoader;
     }
 
     _validateArgs(logger, args) {
