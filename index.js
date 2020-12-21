@@ -1,6 +1,6 @@
 const {Client} = require('@elastic/elasticsearch');
 const {dedup, ensureThunkSync} = require('@raychee/utils');
-const {isEmpty, get} = require('lodash');
+const {get} = require('lodash');
 const {v4: uuid4} = require('uuid');
 
 
@@ -45,6 +45,9 @@ function makeFullOptions(
     }
 }
 
+function getJobId(logger) {
+    return get(logger, ['config', '_id'], '');
+}
 
 class BulkLoader {
     constructor(elastic) {
@@ -52,8 +55,8 @@ class BulkLoader {
         this.indices = {};
         this.updating = {};
         this.committing = undefined;
-        this.errors = [];
-        this.bulk = [];
+        this.errorByJobId = {};
+        this.bulkByJobId = {};
         
         this._ensureIndex = dedup(BulkLoader.prototype._ensureIndex.bind(this), {key: (_, index) => index});
     }
@@ -62,36 +65,46 @@ class BulkLoader {
         while (this.committing) {
             await this.committing;
         }
-        while (this.bulk.length >= this.elastic.options.bulk.batchSize) {
+        const jobId = getJobId(logger);
+        const bulk = this.bulkByJobId[jobId] || [];
+        this.bulkByJobId[jobId] = bulk;
+        while (bulk.length >= this.elastic.options.bulk.batchSize) {
             if (!this.committing) {
                 this.committing = this._commit(logger, {debug}).finally(() => this.committing = undefined);
             }
             await this.committing;
         }
-        this.bulk.push({logger, index, source, createIndex});
+        const error = this.errorByJobId[jobId];
+        if (error) {
+            throw error;
+        }
+        bulk.push({index, source, createIndex});
     }
 
     async flush(logger, {debug} = {}) {
         logger = logger || this.elastic.logger;
-        if (this.bulk.length > 0) {
+        const jobId = getJobId(logger);
+        while ((this.bulkByJobId[jobId] || []).length > 0) {
             if (!this.committing) {
                 this.committing = this._commit(logger, {debug}).finally(() => this.committing = undefined);
             }
             await this.committing;
         }
-        if (!isEmpty(this.updating)) {
-            await Promise.all(Object.values(this.updating));
+        const updating = Object.values(this.updating);
+        if (updating.length > 0) {
+            await Promise.all(updating);
         }
-        if (this.errors.length > 0) {
-            const [error] = this.errors;
-            this.errors = [];
+        const error = this.errorByJobId[jobId];
+        if (error) {
+            delete this.errorByJobId[jobId];
             throw error;
         }
     }
 
     async _commit(logger, {debug} = {}) {
         const opId = uuid4();
-        const bulk = this.bulk;
+        const jobId = getJobId(logger);
+        const bulk = this.bulkByJobId[jobId] || [];
         if (bulk.length <= 0) return;
         while (Object.keys(this.updating).length >= this.elastic.options.bulk.concurrency) {
             if (debug || this.elastic.options.otherOptions.debug) {
@@ -99,9 +112,8 @@ class BulkLoader {
             }
             await Promise.race(Object.values(this.updating));
         }
-        if (this.errors.length > 0) {
-            const [error] = this.errors;
-            this.errors = [];
+        const error = this.errorByJobId[jobId];
+        if (error) {
             throw error;
         }
         if (debug || this.elastic.options.otherOptions.debug) {
@@ -110,8 +122,8 @@ class BulkLoader {
                 ', concurrency = ', Object.keys(this.updating).length + 1, '/', this.elastic.options.bulk.concurrency, '.'
             );
         }
-        this.updating[opId] = this._index(bulk)
-            .catch(e => this.errors.push(e))
+        this.updating[opId] = this._index(logger, bulk)
+            .catch(e => this.errorByJobId[jobId] = e)
             .finally(() => {
                 delete this.updating[opId];
                 if (debug || this.elastic.options.otherOptions.debug) {
@@ -121,19 +133,18 @@ class BulkLoader {
                     );
                 }
             });
-        this.bulk = [];
+        this.bulkByJobId[jobId] = [];
     }
     
-    async _index(bulk) {
-        const bulkIndices = {};
-        const [{logger}] = bulk;
-        for (const {logger, index: {index: {_index}}, createIndex} of bulk) {
-            const indexRequest = createIndex ? ensureThunkSync(createIndex, _index) : {index: _index};
-            const index = _index || indexRequest.index;
-            bulkIndices[index] = {logger, indexRequest};
+    async _index(logger, bulk) {
+        const indicesToCreate = {};
+        for (const {index: {index: {_index}}, createIndex} of bulk) {
+            const createIndexRequest = createIndex ? ensureThunkSync(createIndex, _index) : {index: _index};
+            const index = _index || createIndexRequest.index;
+            indicesToCreate[index] = createIndexRequest;
         }
-        for (const [index, {logger, indexRequest}] of Object.entries(bulkIndices)) {
-            await this._ensureIndex(logger, index, indexRequest);
+        for (const [index, createIndexRequest] of Object.entries(indicesToCreate)) {
+            await this._ensureIndex(logger, index, createIndexRequest);
         }
         const body = bulk.flatMap(v => [v.index, v.source]);
         await this.elastic.bulk(logger, {body});
@@ -214,28 +225,50 @@ class ElasticSearch {
 
     async bulk(logger, ...args) {
         logger = logger || this.logger;
-        args = this._validateArgs(logger, args);
-        let resp;
+        let [params, options] = this._validateArgs(logger, args);
         for (let trial = 0; trial <= this.options.bulk.maxRetriesForTooManyRequests; trial++) {
-            resp = await this._operate(logger, (client) => client.bulk(...args));
-            if (this.options.request.fullResponse) {
-                resp = resp.body;
-            }
-            if (resp.errors) {
-                const errorItems = resp.items
-                    .map((item, pos) => ({pos, ...Object.values(item)[0]}))
-                    .filter(({error}) => error);
-                if (errorItems.some(item => item.status !== 429)) {
-                    logger.fail('_es_bulk_error', errorItems);
+            const resp = await this._operate(logger, (client) => client.bulk(params, options));
+            const body = this.options.request.fullResponse ? resp.body : resp;
+            if (body.errors) {
+                let i = 0, hasErrorOtherThanTooManyRequests = false;
+                const retry = [], errorItems = [];
+                for (const item of body.items) {
+                    const [[action, {status, error}]] = Object.entries(item);
+                    if (error) {
+                        errorItems.push(item);
+                        if (status !== 429) {
+                            hasErrorOtherThanTooManyRequests = true;
+                        }
+                        retry.push(params.body[i]);
+                        if (['create', 'index', 'update'].includes(action)) {
+                            retry.push(params.body[i + 1]);
+                        }
+                    }
+                    i++;
+                    if (['create', 'index', 'update'].includes(action)) i++;
+                }
+                if (hasErrorOtherThanTooManyRequests) {
+                    logger.fail('plugin_elasticsearch_bulk_error', errorItems.filter(item => {
+                        const [{status}] = Object.values(item);
+                        return status !== 429;
+                    }));
                 }
                 if (trial < this.options.bulk.maxRetriesForTooManyRequests) {
-                    logger.info(
+                    if (retry.length <= 0) {
+                        logger.crash(
+                            'plugin_elasticsearch_bulk_crash', 'Bulk operation has failed because of too many requests, ',
+                            'but no retryable bulk operations can be found.'
+                        );
+                    }
+                    logger.warn(
                         'Bulk operation has failed because of too many requests. Will retry (',
                         trial + 1, '/', this.options.bulk.maxRetriesForTooManyRequests,
                         ') in ', this.options.bulk.retryIntervalForTooManyRequests, ' seconds.',
                     );
+                    await logger.sleep(this.options.bulk.retryIntervalForTooManyRequests);
+                    params = {...params, body: retry};
                 } else {
-                    logger.fail('_es_bulk_error', errorItems);
+                    logger.fail('plugin_elasticsearch_bulk_error', errorItems);
                 }
             } else {
                 return resp;
@@ -355,7 +388,7 @@ class ElasticSearch {
             options = {};
         }
         if (callback != null) {
-            logger.crash('_es_plugin_invalid_args', 'No callback-style is allowed, please use promise-style instead.');
+            logger.crash('plugin_elasticsearch_invalid_args', 'No callback-style is allowed, please use promise-style instead.');
         }
         return [params, options];
     }
@@ -367,7 +400,7 @@ class ElasticSearch {
             promise = promise.then(resp => resp.body);
         }
         return promise.catch(error => {
-            logger.fail('_es_error', error);
+            logger.fail('plugin_elasticsearch_error', error);
         });
     }
 
