@@ -1,6 +1,6 @@
 {
   "name": "@raychee/catalyst-plugin-elasticsearch",
-  "version": "0.0.10",
+  "version": "0.0.11",
   "description": "elasticsearch plugin for catalyst",
   "main": "index.js",
   "scripts": {},

@@ -66,9 +66,8 @@ class BulkLoader {
             await this.committing;
         }
         const jobId = getJobId(logger);
-        const bulk = this.bulkByJobId[jobId] || [];
-        this.bulkByJobId[jobId] = bulk;
-        while (bulk.length >= this.elastic.options.bulk.batchSize) {
+        this.bulkByJobId[jobId] = this.bulkByJobId[jobId] || [];
+        while (this.bulkByJobId[jobId].length >= this.elastic.options.bulk.batchSize) {
             if (!this.committing) {
                 this.committing = this._commit(logger, {debug}).finally(() => this.committing = undefined);
             }
@@ -78,7 +77,7 @@ class BulkLoader {
         if (error) {
             throw error;
         }
-        bulk.push({index, source, createIndex});
+        this.bulkByJobId[jobId].push({index, source, createIndex});
     }
 
     async flush(logger, {debug} = {}) {
