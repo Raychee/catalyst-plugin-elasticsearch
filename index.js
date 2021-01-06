@@ -12,6 +12,11 @@ module.exports = {
     async create(options) {
         return new ElasticSearch(this, options);
     },
+    unload(elasticSearch, job) {
+        const jobId = getJobId(job);
+        delete elasticSearch._bulkLoader.bulkByJobId[jobId];
+        delete elasticSearch._bulkLoader.errorByJobId[jobId];
+    },
     async destroy(elasticSearch) {
         await elasticSearch._close();
     }
